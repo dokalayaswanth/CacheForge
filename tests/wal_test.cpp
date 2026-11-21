@@ -1,4 +1,5 @@
 #include "cfdb/wal.hpp"
+#include "cfdb/checksum.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -67,6 +68,16 @@ std::string bytes(std::initializer_list<unsigned int> values) {
         result.push_back(static_cast<char>(value));
     }
     return result;
+}
+
+std::string fileHeader() {
+    return std::string("CFWL") + bytes({1, 0, 0, 0});
+}
+
+std::string frame(const std::string& body) {
+    const auto crc = cfdb::crc32(body);
+    return bytes({crc & 255u, (crc >> 8) & 255u, (crc >> 16) & 255u,
+                  (crc >> 24) & 255u}) + body;
 }
 
 void writeFixture(const std::filesystem::path& path, const std::string& data) {
@@ -148,14 +159,18 @@ void golden_bytes() {
     cfdb::Wal wal(file.path());
     wal.appendPut("city", "Boston");
     wal.appendDelete("city");
-    const auto expected = bytes({1, 4, 0, 0, 0, 6, 0, 0, 0}) + "cityBoston" +
+    // CRC constants independently generated with Python zlib.crc32.
+    const auto expected = fileHeader() + bytes({171, 232, 149, 94}) +
+                          bytes({1, 4, 0, 0, 0, 6, 0, 0, 0}) + "cityBoston" +
+                          bytes({158, 21, 49, 96}) +
                           bytes({2, 4, 0, 0, 0, 0, 0, 0, 0}) + "city";
     require(readBytes(file.path()) == expected, "on-disk bytes must match format");
 
     // Independent reader fixture: both multi-byte and high-bit length bytes.
     const std::string key(258, 'k');
     const std::string value(255, 'v');
-    const auto fixture = bytes({1, 2, 1, 0, 0, 255, 0, 0, 0}) + key + value;
+    const auto fixture = fileHeader() + bytes({227, 0, 140, 45}) +
+                         bytes({1, 2, 1, 0, 0, 255, 0, 0, 0}) + key + value;
     writeFixture(file.path(), fixture);
     const auto records = wal.readAll();
     require(records.size() == 1 && records[0].key == key && records[0].value == value,
@@ -171,19 +186,25 @@ void empty_and_missing_files() {
     requireThrows<std::runtime_error>([&] { (void)wal.readAll(); }, "missing file must fail");
     require(!std::filesystem::exists(file.path()), "read must not create file");
     writeFixture(file.path(), "");
-    require(wal.readAll().empty(), "empty file must succeed");
+    requireThrows<std::runtime_error>([&] { (void)wal.readAll(); }, "zero bytes is uninitialized");
+    require(readBytes(file.path()).empty(), "read must not initialize");
+    wal.ensureExists();
+    require(readBytes(file.path()) == fileHeader(), "initialize exactly one header");
+    wal.ensureExists();
+    require(readBytes(file.path()) == fileHeader(), "ensure must not duplicate header");
+    require(wal.readAll().empty(), "header-only log must succeed");
 }
 
 void truncated_records() {
     TempLog file;
     cfdb::Wal wal(file.path());
-    const auto put = bytes({1, 3, 0, 0, 0, 5, 0, 0, 0}) + "keyvalue";
-    const auto deletion = bytes({2, 3, 0, 0, 0, 0, 0, 0, 0}) + "key";
+    const auto put = frame(bytes({1, 3, 0, 0, 0, 5, 0, 0, 0}) + "keyvalue");
+    const auto deletion = frame(bytes({2, 3, 0, 0, 0, 0, 0, 0, 0}) + "key");
     for (const auto& record : {put, deletion}) {
         for (std::size_t length = 1; length < record.size(); ++length) {
             // Test every cut, both as the first record and after a valid prefix.
             for (const auto& prefix : {std::string{}, put}) {
-                const auto damaged = prefix + record.substr(0, length);
+                const auto damaged = fileHeader() + prefix + record.substr(0, length);
                 writeFixture(file.path(), damaged);
                 requireThrows<std::runtime_error>([&] { (void)wal.readAll(); },
                                                   "partial record must fail");
@@ -191,7 +212,7 @@ void truncated_records() {
             }
         }
     }
-    writeFixture(file.path(), put);
+    writeFixture(file.path(), fileHeader() + put);
     require(wal.readAll().size() == 1, "EOF at record boundary must succeed");
 }
 
@@ -199,7 +220,7 @@ void invalid_operations() {
     TempLog file;
     cfdb::Wal wal(file.path());
     for (unsigned int operation : {0u, 3u, 128u, 255u}) {
-        writeFixture(file.path(), bytes({operation, 0, 0, 0, 0, 0, 0, 0, 0}));
+        writeFixture(file.path(), fileHeader() + frame(bytes({operation, 0, 0, 0, 0, 0, 0, 0, 0})));
         requireThrows<std::runtime_error>([&] { (void)wal.readAll(); }, "invalid operation must fail");
     }
 }
@@ -207,7 +228,7 @@ void invalid_operations() {
 void invalid_delete_value() {
     TempLog file;
     cfdb::Wal wal(file.path());
-    writeFixture(file.path(), bytes({2, 1, 0, 0, 0, 1, 0, 0, 0}) + "kv");
+    writeFixture(file.path(), fileHeader() + frame(bytes({2, 1, 0, 0, 0, 1, 0, 0, 0}) + "kv"));
     requireThrows<std::runtime_error>([&] { (void)wal.readAll(); }, "delete value must be rejected");
 }
 
@@ -223,7 +244,7 @@ void invalid_encoded_lengths() {
         bytes({2, 255, 255, 255, 255, 0, 0, 0, 0})
     };
     for (const auto& header : headers) {
-        writeFixture(file.path(), header);
+        writeFixture(file.path(), fileHeader() + frame(header));
         try {
             (void)wal.readAll();
             throw std::logic_error("oversized encoded length was accepted");
@@ -272,6 +293,105 @@ void append_open_failure() {
     requireThrows<std::runtime_error>([&] { wal.appendDelete("key"); }, "delete open failure must throw");
 }
 
+
+void header_validation() {
+    TempLog file;
+    cfdb::Wal wal(file.path());
+    const auto valid = fileHeader();
+    // Include old-format records, all nonempty partial headers, bad magic and version.
+    std::vector<std::string> invalid{
+        bytes({1, 1, 0, 0, 0, 1, 0, 0, 0}) + "kv",
+        std::string("NOPE") + bytes({1, 0, 0, 0}),
+        std::string("CFWL") + bytes({2, 0, 0, 0}),
+        std::string("CFWL") + bytes({1, 0, 0, 1})
+    };
+    for (std::size_t n = 1; n < valid.size(); ++n) {
+        invalid.push_back(valid.substr(0, n));
+    }
+    for (const auto& data : invalid) {
+        writeFixture(file.path(), data);
+        requireThrows<std::runtime_error>([&] { (void)wal.readAll(); }, "bad header read");
+        requireThrows<std::runtime_error>([&] { wal.ensureExists(); }, "bad header ensure");
+        requireThrows<std::runtime_error>([&] { wal.appendPut("k", "v"); }, "bad header put");
+        requireThrows<std::runtime_error>([&] { wal.appendDelete("k"); }, "bad header delete");
+        require(readBytes(file.path()) == data, "bad header operations must preserve bytes");
+    }
+    writeFixture(file.path(), "");
+    wal.appendDelete("k");
+    require(wal.readAll().size() == 1, "append initializes zero-byte log");
+    require(readBytes(file.path()).size() == 8 + 13 + 1, "only one header on initial append");
+    wal.ensureExists();
+    wal.appendPut("k", "v");
+    require(readBytes(file.path()).size() == 8 + 14 + 15, "header must not be repeated");
+}
+
+void single_bit_corruption() {
+    TempLog file;
+    cfdb::Wal wal(file.path());
+    wal.appendPut("city", "Boston");
+    const auto original = readBytes(file.path());
+    // Every bit of the checksum, operation, lengths, key and value.
+    for (std::size_t i = 8; i < original.size(); ++i) {
+        for (unsigned int bit = 0; bit < 8; ++bit) {
+            auto damaged = original;
+            damaged[i] = static_cast<char>(static_cast<unsigned char>(damaged[i]) ^ (1u << bit));
+            writeFixture(file.path(), damaged);
+            try {
+                (void)wal.readAll();
+                throw std::logic_error("corrupted record accepted");
+            } catch (const std::runtime_error& error) {
+                const std::string message = error.what();
+                require(message.find("byte offset 8") != std::string::npos, "error must identify record start");
+                if (i < 12 || i >= 21) {
+                    require(message.find("checksum mismatch") != std::string::npos,
+                            "checksum and payload bit flips must trigger checksum validation");
+                }
+            }
+            require(readBytes(file.path()) == damaged, "corruption must not cause repair");
+        }
+    }
+    // Shift a byte from value to key without changing total payload length.
+    // Structure remains valid, so only checksum coverage of metadata catches it.
+    auto lengths_changed = original;
+    lengths_changed.at(13) = 5;
+    lengths_changed.at(17) = 5;
+    writeFixture(file.path(), lengths_changed);
+    try {
+        (void)wal.readAll();
+        throw std::logic_error("modified lengths accepted");
+    } catch (const std::runtime_error& error) {
+        require(std::string(error.what()).find("checksum mismatch") != std::string::npos,
+                "checksum must cover length metadata");
+    }
+    // Structurally valid operation change still must be covered by CRC.
+    const auto put_empty = fileHeader() + frame(bytes({1, 0, 0, 0, 0, 0, 0, 0, 0}));
+    auto changed = put_empty;
+    changed[12] = 2; // Put -> Delete, same valid zero-length fields.
+    writeFixture(file.path(), changed);
+    requireThrows<std::runtime_error>([&] { (void)wal.readAll(); }, "operation must be checksummed");
+}
+
+void corrupt_middle_record() {
+    TempLog file;
+    cfdb::Wal wal(file.path());
+    wal.appendPut("first", "one");
+    const auto offset = readBytes(file.path()).size();
+    wal.appendPut("middle", "two");
+    wal.appendPut("last", "three");
+    auto damaged = readBytes(file.path());
+    damaged[offset + 13] ^= 1; // Change middle key, leaving trailing record intact.
+    writeFixture(file.path(), damaged);
+    try {
+        (void)wal.readAll();
+        throw std::logic_error("middle corruption was accepted");
+    } catch (const std::runtime_error& error) {
+        require(std::string(error.what()) ==
+                    "WAL checksum mismatch at byte offset " + std::to_string(offset),
+                "middle corruption must report the correct record offset");
+    }
+    require(readBytes(file.path()) == damaged, "middle corruption must leave log unchanged");
+}
+
 } // namespace
 
 int main() {
@@ -291,7 +411,10 @@ int main() {
         {"invalid encoded lengths", invalid_encoded_lengths},
         {"exact size limits", exact_size_limits},
         {"oversized input preserves file", oversized_input_preserves_file},
-        {"append open failure", append_open_failure}
+        {"append open failure", append_open_failure},
+        {"header validation", header_validation},
+        {"single bit corruption", single_bit_corruption},
+        {"corrupt middle record", corrupt_middle_record}
     };
     int failures = 0;
     for (const auto& test : tests) {

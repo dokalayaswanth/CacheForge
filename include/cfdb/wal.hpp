@@ -20,7 +20,7 @@ struct WalRecord {
 };
 
 // Single-caller binary operation log. Appends assume an existing valid log.
-// Stream flushing is not durable synchronization. No repair or checksum yet.
+// CRC-32 detects accidental corruption. No repair or durable synchronization.
 class Wal {
 public:
     static constexpr std::size_t max_key_size = 64 * 1024;
@@ -28,11 +28,16 @@ public:
 
     explicit Wal(std::filesystem::path path);
 
+    // Initialize missing/zero-byte logs with the v1 header; validate nonempty headers.
+    // Does not create parent directories; throws runtime_error on I/O failure.
+    void ensureExists();
+
     void appendPut(const std::string& key, const std::string& value);
     void appendDelete(const std::string& key);
 
     // Returns all records in order. Throws runtime_error on malformed data or
-    // I/O failure; does not return a partial result or alter the log.
+    // I/O failure (including uninitialized files). Never returns a partial result
+    // or alters the log.
     [[nodiscard]] std::vector<WalRecord> readAll() const;
 
 private:
